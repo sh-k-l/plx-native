@@ -1998,6 +1998,16 @@ path. Never run only this one before a release. `tests/README.md` has the tier t
   present/IRQ observation to an already-running app, with no baseline; it checks profiler triggers
   and labels pacing invalid when one is armed. For a live freeze use `tools/plxnative-sample`; unlike the
   shipped crash path its `watch` mode is a foreground developer command and sends nothing.
+- **Poster-upload pacing, since 2026-10-08:** a scene may set `upload_late_share_max` (and
+  `upload_frames_min`, default 15). Over the frames that uploaded posters (mean upload at most
+  120 000 px, so a backdrop never counts), the share whose present-to-present interval was
+  >= 22 ms must be at or under the limit. The armed heartbeat carries it as ` pupf=<frames>
+  pupf_ge22=<late> pup=<uploads>` (`diag::heartbeat`, present only in a second that uploaded
+  posters), summed over the whole run; the scene arms `plxnative-framedrop` at a threshold nothing
+  reaches, so there is no per-frame log. `library-scroll` carries 0.15, PROVISIONAL (baseline
+  22-46 % with `warm_tex` drawing to framebuffer 0, 4 % offscreen; not yet confirmed on the
+  committed tree). The prepare budget is priced from the same measurement: `Poster` 2500 us under a
+  5000 us ceiling (`ui/src/frame/budget.rs`).
 - **Dev trigger files (read once at boot, in the install's RUNTIME ROOT).** There are ~40; this
   lists the ones worth knowing by name. **The ROOT moved for flavoured installs and ONLY for
   them:** the stable install keeps `/tmp` byte for byte, so every `/tmp/plxnative-*` path written

@@ -5400,14 +5400,72 @@ def parse_framedrop(lines, route):
     return out
 
 
+# A scene graded only on the poster-upload share needs the detector ARMED (its frame pacing and
+# per-frame upload counters ride the heartbeat only then) but wants no `FRAMEDROP` line at all:
+# a threshold nothing reaches arms the instrument without a log write per slow frame.
+UPLOAD_GATE_THRESHOLD_MS = 1000
+
+
 def frame_ceiling_threshold(scene):
-    """The `plxnative-framedrop` content to arm for this scene, or None when it declares neither
-    ceiling. The detector logs a FRAMEDROP line only ABOVE its threshold, so the threshold is the
-    lower of the two ceilings: everything a gate could fail on is then in the log."""
+    """The `plxnative-framedrop` content to arm for this scene, or None when it declares no frame
+    gate. The detector logs a FRAMEDROP line only ABOVE its threshold, so the threshold is the
+    lower of the two ceilings: everything a gate could fail on is then in the log. A scene that
+    declares only `upload_late_share_max` arms it at [`UPLOAD_GATE_THRESHOLD_MS`]."""
     cs = [scene[k] for k in ("worst_ceiling_ms", "stall_ceiling_ms") if scene.get(k) is not None]
     if not cs:
-        return None
+        return str(UPLOAD_GATE_THRESHOLD_MS) if scene.get("upload_late_share_max") is not None else None
     return str(int(min(cs)))
+
+
+# ` pupf=<n> pupf_ge22=<k> pup=<u>` — the armed heartbeat's poster-upload tally for that second
+# (`diag::heartbeat::FramePacing::note_uploads`): frames that uploaded posters (mean upload at most
+# `POSTER_UPLOAD_MAX_PX`), those of them whose present-to-present interval was >= 22 ms, and the
+# uploads on them. Absent in a second with none, so a log from an older build or an unarmed run
+# yields no samples and `grade_upload_pacing` fails it rather than passing on zero.
+PUP_RE = re.compile(r"\bloop=\d+ route=(\w+)(?: overlay=(\w+))?.*?\bpupf=(\d+) pupf_ge22=(\d+) pup=(\d+)")
+
+
+def parse_upload_pacing(lines, route, overlay):
+    """`(upload_frames, late_frames, uploads)` summed over the whole run's heartbeats on this route
+    (warmup included: the load bursts are the point)."""
+    reject_simulator(lines)
+    reject_recorder(lines)
+    frames = late = uploads = 0
+    for ln in lines:
+        m = PUP_RE.search(ln)
+        if not m or m.group(1) != route:
+            continue
+        if overlay and (m.group(2) or "none") != overlay:
+            continue
+        frames += int(m.group(3))
+        late += int(m.group(4))
+        uploads += int(m.group(5))
+    return frames, late, uploads
+
+
+def grade_upload_pacing(scene, lines, route, overlay):
+    """`upload_late_share_max`: of the frames that uploaded posters, the share whose frame interval
+    was >= 22 ms must be <= the limit (and `upload_frames_min` of them must exist, default 15, so a
+    scene that loaded nothing cannot pass on an empty set).
+
+    This is the regression gate for the poster warm-up: `warm_tex` drawing to framebuffer 0 took
+    the back-buffer wait inside `prepare`, which put the page's draw work behind it, and 22-46 % of
+    Library's poster-upload frames ran >= 22 ms (television, 2026-10-08); with the warm offscreen
+    it was 4 %. The limit is PROVISIONAL until a television run confirms it on the committed tree.
+    Returns (ok, detail_suffix)."""
+    limit = scene.get("upload_late_share_max")
+    if limit is None:
+        return True, ""
+    need = scene.get("upload_frames_min", 15)
+    frames, late, uploads = parse_upload_pacing(lines, route, overlay)
+    if frames < need:
+        return False, (f" | FAIL: {frames} poster-upload frame(s) in the heartbeat (need {need}) — "
+                       f"the scene loaded no posters, or this build/run lacks `pupf=`")
+    share = late / frames
+    ok = share <= limit
+    detail = (f" | poster-upload frames >= 22ms: {late}/{frames} = {share:.0%} "
+              f"({uploads / frames:.2f} uploads/frame) vs upload_late_share_max {limit:.0%}")
+    return ok, (detail if ok else " | FAIL:" + detail[2:])
 
 
 def grade_frame_ceilings(scene, lines, route, overlay, warmup):
@@ -6057,6 +6115,10 @@ def run_fps_scene(scene, cfg, token, *, extra_triggers=(), capture=None,
     ok_o, detail_o = grade_coldopen(scene, lines, route, overlay)
     ok = ok and ok_o
     detail += detail_o
+
+    ok_u, detail_u = grade_upload_pacing(scene, lines, route, overlay)
+    ok = ok and ok_u
+    detail += detail_u
 
     ok_p, detail_p = grade_poster_gate(scene, lines)
     ok = ok and ok_p
