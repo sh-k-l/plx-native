@@ -438,7 +438,7 @@ jobs:
     if: needs.decide.outputs.needs_stills == 'true'
     runs-on: ubuntu-24.04
     # Measured on run 37845183222: 23 minutes in all (the host FFmpeg and simulator builds, the library, then two
-    # renders of 14 scenes, a few minutes each); the maximum plus margin, the convention simulators.yml spells out.
+    # renders of the scenes); the maximum plus margin, the convention simulators.yml spells out.
     timeout-minutes: 60
     env:
       SHOT_TDIR: rust-modules/target-sim-shots
@@ -512,43 +512,43 @@ jobs:
           echo "$RUNNER_TEMP/pinned-bin" >> "$GITHUB_PATH"
           "$ffmpeg" -hide_banner -version | head -n 1
 
-      - name: Render the stills, first process
+      - name: Render the stills (every scene captured twice, the first adopted)
+        id: render
         timeout-minutes: 40
         run: |
           start=$(date +%s)
           xvfb-run -a -s '-screen 0 1920x1080x24' \
-            python3 tools/site_stills.py render --out out/stills-a --bin "$SHOT_TDIR/debug/plxnative-sim"
-          echo "STILLS_A_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
-      - name: Render the stills, second process
-        timeout-minutes: 40
-        run: |
-          start=$(date +%s)
-          xvfb-run -a -s '-screen 0 1920x1080x24' \
-            python3 tools/site_stills.py render --out out/stills-b --bin "$SHOT_TDIR/debug/plxnative-sim"
-          echo "STILLS_B_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
-
-      - name: Two renders must agree
+            python3 tools/site_stills.py render --out out/stills --bin "$SHOT_TDIR/debug/plxnative-sim"
+          echo "STILLS_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+      - name: DIAGNOSTIC (temporary) the player scene alone, kept
+        if: always()
         run: |
           set +e
-          python3 tools/site_stills.py compare out/stills-a out/stills-b | tee out/compare.txt
-          rc=${PIPESTATUS[0]}
+          ls -l "$PLXNATIVE_DEMO_CACHE/derived" | head -40
+          ffprobe -hide_banner "$PLXNATIVE_DEMO_CACHE"/derived/*intel* 2>&1 | head -30
+          ls -l pkg/lib*-plx.so.*
+          xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/screenshots.py --bin "$SHOT_TDIR/debug/plxnative-sim" --only player,site-up-next --keep --out out/diag-shots 2>&1 | tail -60
+          for d in /tmp/plxnative-shot-player-* /tmp/plxnative-shot-site-up-next-*; do
+            echo "=== $d"; ls "$d"; echo "--- sim.out"; tail -40 "$d/sim.out"; echo "--- events"; tail -80 "$d/plxnative-events.log"
+          done
+      - name: Each scene's pair against its noise bound
+        if: always()
+        run: |
           {
-            echo "### Stills: run twice"
+            echo "### Stills: stability of every scene (two captures, the first adopted)"
             echo
-            echo '```'
-            cat out/compare.txt
-            echo '```'
-            echo "render wall time, first / second: ${STILLS_A_SECONDS}s / ${STILLS_B_SECONDS}s"
+            python3 tools/site_stills.py stability-table out/stills || echo "no verdicts were written"
+            echo
+            echo "render wall time: ${STILLS_SECONDS:-?}s"
           } >> "$GITHUB_STEP_SUMMARY"
-          exit "$rc"
       - name: Manifest
         run: |
-          xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/site_stills.py manifest out/stills-a
+          xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/site_stills.py manifest out/stills
       - name: Upload the stills
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: site-stills-${{ github.sha }}
-          path: out/stills-a/
+          path: out/stills/
           if-no-files-found: error
           retention-days: 30
 

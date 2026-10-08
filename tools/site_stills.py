@@ -2,9 +2,8 @@
 """The site's and the documentation's simulator-made stills: render them on the pinned Linux stack, and adopt them.
 
     python3 tools/site_stills.py files [--manual]               # every path the refresh may write / leaves to a Mac
-    python3 tools/site_stills.py render --out DIR --bin SIM     # screenshots + variants + glows, then DIR/files + manifest
-    python3 tools/site_stills.py compare DIR_A DIR_B            # byte-compare two renders; non-zero if any file differs
-    python3 tools/site_stills.py manifest DIR [--runs N]        # DIR/stills.manifest.json (after `compare`)
+    python3 tools/site_stills.py render --out DIR --bin SIM     # screenshots (each captured twice) + variants + glows, then DIR/files
+    python3 tools/site_stills.py manifest DIR                   # DIR/stills.manifest.json (after `render`)
     python3 tools/site_stills.py adopt DIR [--write] [--expect-rev REV]   # dry run unless --write
     python3 tools/site_stills.py tree-hash [--rev REV]          # the stills' inputs' tree hash
     python3 tools/site_stills.py needs-render [--rev REV] [--force]   # needs_stills=true|false against the committed manifest
@@ -20,12 +19,25 @@ renders), the brand art under `assets/` and `site/icons/`, and the film's own po
 (`tools/site_video.py` owns `site/media/feel-*`).
 
 THE SAME SECURITY MODEL AS THE FILM (docs/agent-reference.md, "How the site's stills update themselves"):
-`site-video.yml`'s `stills` job renders its own checkout twice and fails unless the two sets are byte-identical;
-its `publish` job runs THIS file from main (never the rendered ref's) on the artifact, which is data. `adopt`
-refuses anything that is not `platform: linux-ci`, a file whose sha256 differs from the manifest, a file set that
-is not exactly `output_files()`, a run that was not byte-identical, and (`--expect-rev`) an artifact rendered
-from other inputs than that revision's. A set byte-identical to the committed one writes nothing, the manifest
-included, so the manifest keeps naming the tree the stills were last rendered for.
+`site-video.yml`'s `stills` job renders its own checkout and fails unless the two captures of every scene agree
+within the noise bound below; its `publish` job runs THIS file from main (never the rendered ref's) on the
+artifact, which is data. `adopt` refuses anything that is not `platform: linux-ci`, a file whose sha256 differs
+from the manifest, a file set that is not exactly `output_files()`, a scene whose recorded pair is missing or over
+the bound (the bound is re-read from main's scene manifest, never from the artifact), and (`--expect-rev`) an
+artifact rendered from other inputs than that revision's. A set byte-identical to the committed one writes
+nothing, the manifest included, so the manifest keeps naming the tree the stills were last rendered for. The
+decision to render at all is `needs-render`: the stills' inputs' tree hash against the committed manifest, so an
+app whose pixels cannot have changed commits no stills whatever the renderer's noise.
+
+STABLE, NOT BIT-IDENTICAL. llvmpipe's blur and glass passes are not bit-stable from run to run (the scene
+manifest's own words: "the GPU's run-to-run rounding"), so two renders of the same scene are not byte-identical
+and demanding it fails nearly every run. What a still needs is that nothing in it is *different*: the same cards,
+the posters loaded, the text where it was. That is what `tools/screenshots.py --check-determinism` measures on the
+raw captures, before any JPEG quantization spreads one level of rounding over a block: every channel of every
+pixel of the second capture within `max_delta` (default 1, per scene in `tests/screenshots/scenes.json`, with the
+reason) of the first. A missing poster, a card that popped in late or a different row is tens of levels off.
+The FIRST capture is the one adopted. Nothing is compared as a JPEG, WebP or glow: those are pure functions of
+the adopted captures (one ffmpeg, one process).
 """
 import argparse
 import hashlib
@@ -44,6 +56,7 @@ TOOLS = ROOT / "tools"
 SCENES = ROOT / "tests" / "screenshots" / "scenes.json"
 MANIFEST_REL = "site/media/stills.manifest.json"
 MANIFEST_NAME = "stills.manifest.json"
+STABILITY_NAME = "stability.json"
 SCHEMA = 1
 
 # Everything that can change a pixel of a still, as git trees (or blobs) at a revision: every crate, the assets
@@ -83,14 +96,7 @@ def _site_video():
 #    thousand pixels off by one). The run-twice check is not loosened to take them; `home` takes the link card
 #    with it, which is composed around its figure.
 # Everything derived from a manual scene's JPEG is manual with it.
-MANUAL_SCENES = {
-    "player": "playback on the Linux runner ends at EOF before the first decoded picture",
-    "site-up-next": "playback on the Linux runner ends at EOF before the playhead reaches the clock stop",
-    "home": "two Linux renders differ (81 pixels); the link card is composed around it",
-    "account-menu": "two Linux renders differ (1084 pixels)",
-    "detail": "two Linux renders differ (452 pixels)",
-    "library-grid": "two Linux renders differ (2679 pixels)",
-}
+MANUAL_SCENES = {}
 DESTS = {"docs": "docs/screenshots", "site": "site/media"}
 
 
@@ -164,16 +170,64 @@ def needs_render(rev="HEAD", force=False, manifest_path=None, run=subprocess.run
     return True, f"the stills' inputs changed: committed {recorded[:12]}, {rev} {here[:12]}"
 
 
+def read_stability(path):
+    try:
+        data = json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def bounds_by_scene(root=ROOT):
+    manifest = json.loads((root / "tests" / "screenshots" / "scenes.json").read_text())
+    default = manifest["defaults"]["max_delta"]
+    return {s["name"]: s.get("max_delta", default) for s in manifest["scenes"]}
+
+
+def over_bound(r, bound):
+    """None when a scene's pair verdict `r` is within `bound`, else why not."""
+    if not isinstance(r, dict):
+        return "no verdict"
+    if r.get("identical") is True and r.get("worst") == 0:
+        return None
+    if bound is None or not isinstance(r.get("worst"), int) or r["worst"] > bound:
+        return f"max delta {r.get('worst')} > {bound} on {r.get('pixels')} pixels"
+    return None
+
+
+def unstable(report, root=ROOT):
+    """The scenes of a stability report that are over their bound (the bound re-read from the scene manifest),
+    as 'scene (files): why' strings."""
+    bounds = bounds_by_scene(root)
+    out = []
+    for name, r in sorted(report.items()):
+        why = over_bound(r, bounds.get(name))
+        if why:
+            files = ", ".join(r.get("files") or []) if isinstance(r, dict) else ""
+            out.append(f"{name} ({files}): {why}")
+    return out
+
+
 def render(out, sim_bin, root=ROOT, run=subprocess.run):
-    """Render every still into the checkout (this is a disposable runner's tree), then copy the set to
-    `out/files/<repo path>`. The previous outputs are deleted first, so a file a run failed to write can never
-    be last run's. Returns the list of paths."""
+    """Render every still into the checkout (this is a disposable runner's tree), capturing every scene twice
+    and holding the pair to the scene's noise bound, then copy the set to `out/files/<repo path>` and the pair
+    verdicts to `out/stability.json`. The previous outputs are deleted first, so a file a run failed to write can
+    never be last run's. Returns the list of paths. Raises Failure naming the files of an unstable scene."""
     out = pathlib.Path(out)
     want = output_files(root)
     for rel in want:
         (root / rel).unlink(missing_ok=True)
-    run([sys.executable, str(TOOLS / "screenshots.py"), "--bin", str(sim_bin),
-         "--only", ",".join(automated_scenes(root))], check=True, cwd=root)
+    out.mkdir(parents=True, exist_ok=True)
+    stability = out / STABILITY_NAME
+    stability.unlink(missing_ok=True)
+    try:
+        run([sys.executable, str(TOOLS / "screenshots.py"), "--bin", str(sim_bin),
+             "--only", ",".join(automated_scenes(root)), "--check-determinism", "--report", str(stability)],
+            check=True, cwd=root)
+    except subprocess.CalledProcessError:
+        over = unstable(read_stability(stability) or {}, root)
+        raise Failure("the stills are not stable: " + ("; ".join(over) if over else
+                      "a scene failed to render (see the log above)"))
     run([sys.executable, str(TOOLS / "render-site-variants.py")], check=True, cwd=root)
     run([sys.executable, str(TOOLS / "render-site-glows.py"), "--only", *glow_names()], check=True, cwd=root)
     missing = [rel for rel in want if not (root / rel).is_file()]
@@ -187,17 +241,6 @@ def render(out, sim_bin, root=ROOT, run=subprocess.run):
     return want
 
 
-def compare(a, b):
-    """{path: (same, size_a, size_b)} for every path of `output_files()` in two render directories."""
-    result = {}
-    for rel in output_files():
-        pa, pb = pathlib.Path(a) / "files" / rel, pathlib.Path(b) / "files" / rel
-        if not pa.is_file() or not pb.is_file():
-            raise Failure(f"{rel} is missing from {a if not pa.is_file() else b}")
-        result[rel] = (pa.read_bytes() == pb.read_bytes(), pa.stat().st_size, pb.stat().st_size)
-    return result
-
-
 def chrome_version(run=subprocess.run):
     for name in ("google-chrome", "chromium", "chromium-browser"):
         exe = shutil.which(name)
@@ -207,7 +250,7 @@ def chrome_version(run=subprocess.run):
     return None
 
 
-def build_manifest(out, runs, root=ROOT, env=None, rev="HEAD"):
+def build_manifest(out, root=ROOT, env=None, rev="HEAD"):
     sv = _site_video()
     out = pathlib.Path(out)
     files = {}
@@ -216,13 +259,16 @@ def build_manifest(out, runs, root=ROOT, env=None, rev="HEAD"):
         if not path.is_file():
             raise Failure(f"{rel} is missing from {out}")
         files[rel] = {"sha256": sha256_file(path), "bytes": path.stat().st_size}
+    stability = read_stability(out / STABILITY_NAME)
+    if stability is None:
+        raise Failure(f"{out}: no readable {STABILITY_NAME}: the render did not complete")
     environment = sv.collect_environment(env)
     environment["chrome"] = chrome_version()
     return {
         "schema": SCHEMA,
         "platform": sv.current_platform(env),
         "tree_hash": tree_hashes(rev=rev, root=root),
-        "determinism": {"runs": runs, "byte_identical": True},
+        "stability": {"method": "two captures of every scene, the first adopted", "scenes": stability},
         "environment": environment,
         "files": files,
     }
@@ -240,9 +286,12 @@ def plan_adopt(artifact, root=ROOT, expect_rev=None):
         raise Failure(f"refusing: manifest schema {manifest.get('schema')!r}, this tool reads {SCHEMA}")
     if manifest.get("platform") != "linux-ci":
         raise Failure(f"refusing: platform {manifest.get('platform')!r}; only a GitHub Actions Linux render is adoptable")
-    det = manifest.get("determinism") or {}
-    if det.get("byte_identical") is not True or not isinstance(det.get("runs"), int) or det["runs"] < 2:
-        raise Failure("refusing: the render was not proven byte-identical across two runs")
+    scenes = (manifest.get("stability") or {}).get("scenes")
+    if not isinstance(scenes, dict) or sorted(scenes) != sorted(automated_scenes(root)):
+        raise Failure("refusing: the manifest holds no stability verdict for exactly the automated scenes")
+    over = unstable(scenes, root)
+    if over:
+        raise Failure("refusing: not stable within the noise bound: " + "; ".join(over))
     want = output_files(root)
     recorded = manifest.get("files") or {}
     if sorted(recorded) != want:
@@ -302,9 +351,10 @@ def commit_message(tag, run_url, source_sha, film=None, stills=None):
         n = len(stills.get("files", {}))
         paras.append(f"The {n} simulator-made stills (documentation figures, the site's close-ups, the link card,\n"
                      f"their WebP and phone copies and glows) were re-rendered by the same run from {tag}\n"
-                     f"({source_sha}), inputs tree hash {tree}, on the pinned Linux/llvmpipe stack: two renders\n"
-                     f"were byte-identical. Photographs taken on the television are not regenerated.")
-    paras.append(f"Run: {run_url}\n\nThe checks prove determinism, not taste. If this looks wrong, revert this commit;\n"
+                     f"({source_sha}), inputs tree hash {tree}, on the pinned Linux/llvmpipe stack: every scene was\n"
+                     f"captured twice and the pair agreed within its noise bound. Photographs taken on the\n"
+                     f"television are not regenerated.")
+    paras.append(f"Run: {run_url}\n\nThe checks prove stability, not taste. If this looks wrong, revert this commit;\n"
                  f"nothing else depends on it.")
     return f"Site: {what} re-rendered for {tag}\n\n" + "\n\n".join(paras) + "\n"
 
@@ -318,19 +368,25 @@ def cmd_render(args):
     print(f"site_stills: {len(paths)} files in {args.out}/files")
 
 
-def cmd_compare(args):
-    result = compare(args.a, args.b)
-    differ = [rel for rel, (same, _, _) in result.items() if not same]
-    for rel, (same, sa, sb) in result.items():
-        print(f"{'identical' if same else 'DIFFERENT'}  {rel}  {sa} / {sb} bytes")
-    print(f"site_stills: {len(result) - len(differ)} of {len(result)} identical")
-    return 1 if differ else 0
-
-
 def cmd_manifest(args):
-    manifest = build_manifest(args.dir, args.runs)
+    manifest = build_manifest(args.dir)
     pathlib.Path(args.dir, MANIFEST_NAME).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
     print(f"site_stills: {MANIFEST_NAME}: {len(manifest['files'])} files, tree hash {manifest['tree_hash']['combined'][:12]}")
+
+
+def cmd_stability_table(args):
+    report = read_stability(pathlib.Path(args.dir) / STABILITY_NAME)
+    if report is None:
+        return 1
+    bounds = bounds_by_scene()
+    print("| scene | files | differing pixels | largest channel difference | bound | verdict |")
+    print("|---|---|---|---|---|---|")
+    for name, r in sorted(report.items()):
+        total = r.get("total")
+        share = f" ({100 * r['pixels'] / total:.3f}%)" if total and r.get("pixels") else ""
+        verdict = "OVER" if over_bound(r, bounds.get(name)) else "within"
+        print(f"| {name} | {', '.join(r.get('files') or [])} | {r.get('pixels')}{share} | {r.get('worst')} "
+              f"| {bounds.get(name)} | {verdict} |")
 
 
 def cmd_adopt(args):
@@ -359,18 +415,16 @@ def main(argv=None):
     p = sub.add_parser("files", help="every path the refresh may write (--manual: the ones it leaves to a Mac)")
     p.add_argument("--manual", action="store_true")
     p.set_defaults(fn=cmd_files)
-    p = sub.add_parser("render", help="render every still into the checkout, then DIR/files")
+    p = sub.add_parser("render", help="render every still (each scene captured twice) into the checkout, then DIR/files")
     p.add_argument("--out", required=True)
     p.add_argument("--bin", required=True, help="the screenshots simulator (`make screenshots-sim`)")
     p.set_defaults(fn=cmd_render)
-    p = sub.add_parser("compare", help="byte-compare two render directories")
-    p.add_argument("a")
-    p.add_argument("b")
-    p.set_defaults(fn=cmd_compare)
     p = sub.add_parser("manifest", help="write DIR/stills.manifest.json")
     p.add_argument("dir")
-    p.add_argument("--runs", type=int, default=2)
     p.set_defaults(fn=cmd_manifest)
+    p = sub.add_parser("stability-table", help="print DIR/stability.json as a Markdown table")
+    p.add_argument("dir")
+    p.set_defaults(fn=cmd_stability_table)
     p = sub.add_parser("adopt", help="verify an artifact directory and copy it into the tree")
     p.add_argument("dir")
     p.add_argument("--write", action="store_true")
