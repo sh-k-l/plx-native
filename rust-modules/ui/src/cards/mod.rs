@@ -38,8 +38,10 @@
 //!   under the fade, and the first awake tick grows the focused card from rest.
 //! - **One frame convention.** A [`SectionFrame`]'s `y` is screen space; the painter handed to
 //!   `draw` may carry any translate (see [`SectionFrame`]).
-//! - **Press comes from the frame**, `cx.press` / `f.press` through `PressRead::dip()`, never the
-//!   thread-local. [`Shelf::place`] / [`Grid::place`] answer the live drawn rect and the stop the
+//! - **Press comes from the frame**, `cx.press` / `f.press` through `PressRead::dip_of()`, never the
+//!   thread-local. The dip lands on the card the press OWNS (`PressRead::owner`), focused or not:
+//!   an abandoned press springs back on the card that was pressed while its neighbour takes the
+//!   ordinary focus pop. [`Shelf::place`] / [`Grid::place`] answer the live drawn rect and the stop the
 //!   draw registers is the same value; `rest_rect` is the settled focus-scaled rect.
 //! - **Idle.** Springs report their own motion; a settled section reports none and parks at exact
 //!   rest. No call allocates except the focused tile's label.
@@ -53,7 +55,7 @@
 
 use std::ops::Range;
 
-use plx_machine::machine::{Cx, EntryId, FocusRead, Host, Measure};
+use plx_machine::machine::{Cx, EntryId, FocusKey, FocusRead, Host, Measure};
 
 use crate::screen::DrawFrame;
 use crate::widgets::Art;
@@ -244,10 +246,13 @@ pub(crate) fn want(asked: &mut Option<(usize, usize)>, len: usize, end: usize, m
     Some(len..end)
 }
 
-/// The scale a card paints at: the pop for the focused card, times the frame's press dip.
+/// The scale card `elem` of section `entry` paints at: its pop times the frame's press dip IF it is
+/// the pressed card. The dip follows the press's owner ([`PressRead::owner`]), not focus: an
+/// abandoned press springs back on the card that was pressed while its neighbour takes the focus
+/// pop, and neither card's size may jump on the frame focus moves.
 #[inline]
-pub(crate) fn press_scale(pop: f32, focused: bool, cx: &Cx<'_, impl Host>) -> f32 {
-    if focused { pop * cx.press.dip() } else { pop }
+pub(crate) fn press_scale<H: Host>(pop: f32, entry: EntryId, elem: H::Elem, cx: &Cx<'_, H>) -> f32 {
+    pop * cx.press.dip_of(&FocusKey { entry, elem })
 }
 
 /// `r` (screen space) in painter `p`'s space: the painter's own translate undone, so a rect drawn

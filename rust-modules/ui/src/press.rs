@@ -7,9 +7,14 @@
 //! edges, so we use them. That long press is what opens the **item context menu** on a home shelf
 //! card and on the detail page's episode still (`screens/item_menu.rs`) — see [`LONG_MS`].
 //!
-//! ONE control is pressed at a time (always the currently focused one), so one value suffices — `App.input.press`, the only owner (restructure spec §2.2); draw code reads its published snapshot —
-//! the renderer multiplies the focused tile's scale by [`scale`] while [`is_active`]. Focus can't move
-//! mid-press (navigation [`cancel`]s the press), so "the focused tile" is unambiguous the whole time.
+//! ONE control is pressed at a time, so one value suffices — `App.input.press`, the only owner (restructure spec §2.2); draw code reads its published snapshot —
+//! the renderer multiplies the PRESSED element's scale by [`scale`] while [`is_active`]. Pressed is
+//! not always focused: navigation [`cancel`]s the press, and the spring-back then plays on the card
+//! that was pressed while focus (and its pop) has already moved on. The machine does not know which
+//! element that is; the dispatcher's `InputMachine::dip_owner` does, and hands it to draw code as
+//! `PressRead::owner` for as long as the press is active, so a card dips only if it is the owner.
+//! The control-face consumers that read [`scale`] directly (`CtlPop`, `AvatarRow`) still apply it to
+//! the focused one — see their docs.
 //!
 //! **Two things take this press, not one.** A CARD ([`begin`]) and a CONTROL FACE ([`begin_ctl`]) —
 //! the design system's `Button` / `CircleButton` / `TransportButton`, whose dip arrives through their

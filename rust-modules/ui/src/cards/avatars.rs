@@ -56,8 +56,8 @@ impl AvatarRow {
     }
 
     /// Paint avatar `i` whose settled rect is `base`; returns the drawn (scaled) rect, which is
-    /// also the hit-map stop's. The focused one folds the click dip into its pop and is the one
-    /// the caller paints last.
+    /// also the hit-map stop's. The focused one folds the click dip into its pop (by focus, not by
+    /// `PressRead::owner`: the row has no keys to match) and is the one the caller paints last.
     pub fn draw(&self, p: Painter, i: usize, base: Rect, art: Art, focused: bool, measure: &dyn Measure) -> Rect {
         if focused {
             let sc = self.row.scale(i) * crate::press::scale();

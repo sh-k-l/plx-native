@@ -1059,8 +1059,11 @@ pub const CONTROL_GAP: f32 = 20.0;
 ///
 /// [`scale`](Self::scale) folds in [`press::scale`](crate::press::scale) for the focused control
 /// only. The dip is a FACTOR on top of the focus scale — that is what makes a press read the same on
-/// a 1.07 capsule as on a 1.09 poster — and it belongs to the control being pressed, which is always
-/// the focused one.
+/// a 1.07 capsule as on a 1.09 poster. Unlike a card's dip (`cards::press_scale`, which follows
+/// `PressRead::owner`) it is applied to the FOCUSED control: a row has no element keys to match an
+/// owner against. A direction key that moves focus abandons the press, so on a row of several
+/// controls the spring-back then plays on the control focus moved to; the card shelves, where the
+/// pressed card is a different element from the focused one for the whole spring, do not.
 pub struct CtlPop<const N: usize> {
     sp: [Spring; N],
     focused: Option<usize>,
