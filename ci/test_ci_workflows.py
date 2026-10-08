@@ -604,8 +604,8 @@ class SiteVideoRelease(unittest.TestCase):
         publish = job_body("site-video.yml", "publish")
         self.assertIn("needs: [decide, render, stills]", publish)
         self.assertIn("needs.render.result == 'success' || needs.stills.result == 'success'", publish)
-        # a failed or cancelled film stops the publish; a failed stills job (nondeterministic renders) leaves the film's
-        # refresh alone and the run red
+        # a failed or cancelled film stops the publish; a failed stills job (a scene over its noise bound) leaves the
+        # film's refresh alone and the run red
         self.assertIn("needs.render.result != 'failure'", publish)
         self.assertIn("needs.render.result != 'cancelled'", publish)
         self.assertNotIn("needs.stills.result != 'failure'", publish)
@@ -689,13 +689,15 @@ class SiteVideoRelease(unittest.TestCase):
         self.assertIn("commit-message", publish)
 
     def test_the_stills_ride_the_same_run_and_the_same_commit_on_the_same_terms(self):
-        """The simulator-made stills refresh with the film: rendered twice and required byte-identical, adopted by MAIN's
-        tool from an artifact (data), one allow-listed bot commit, no second workflow, nothing loosened."""
+        """The simulator-made stills refresh with the film: every scene captured twice and held to its noise bound
+        (never to byte identity: llvmpipe's blur is not bit-stable), adopted by MAIN's tool from an artifact (data),
+        one allow-listed bot commit, no second workflow."""
         body = code("site-video.yml")
         stills, publish = job_body("site-video.yml", "stills"), job_body("site-video.yml", "publish")
         self.assertEqual(len(re.findall(r"(?m)^name:", body)), 1)
-        self.assertEqual(stills.count("site_stills.py render"), 2)
-        self.assertIn("site_stills.py compare out/stills-a out/stills-b", stills)
+        self.assertEqual(stills.count("site_stills.py render"), 1)
+        self.assertNotIn("site_stills.py compare", stills)  # no byte-identity gate
+        self.assertIn("site_stills.py stability-table", stills)
         self.assertNotIn("continue-on-error", stills)
         self.assertIn("site_stills.py manifest", stills)
         self.assertIn("actions/upload-artifact@", stills)
@@ -711,6 +713,36 @@ class SiteVideoRelease(unittest.TestCase):
         self.assertEqual(code("release.yml").count("gh workflow run site-video.yml"), 1)
         for name in ("rc.yml", "nightly.yml"):
             self.assertNotIn("site_stills", code(name))
+
+    def publish_runs(self, **results):
+        """Evaluate the publish job's `if:` for the given job results (decide defaults to success)."""
+        publish = job_body("site-video.yml", "publish")
+        cond = re.search(r"(?m)^    if: >-\n((?:      .*\n?)+)", publish).group(1)
+        expr = " ".join(cond.split())
+        results.setdefault("decide", "success")
+        expr = re.sub(r"needs\.(\w+)\.result", lambda m: repr(results.get(m.group(1), "skipped")), expr)
+        expr = expr.replace("always()", "True").replace("&&", " and ").replace("||", " or ").replace("!=", " != ")
+        return eval(expr, {"__builtins__": {}})  # noqa: S307 - the workflow's own boolean expression, over string literals
+
+    def test_a_failed_stills_job_does_not_stop_the_film_and_a_failed_film_stops_everything(self):
+        self.assertTrue(self.publish_runs(render="success", stills="failure"))   # the film lands, the run stays red
+        self.assertTrue(self.publish_runs(render="success", stills="success"))
+        self.assertTrue(self.publish_runs(render="success", stills="skipped"))   # stills' inputs are the committed ones
+        self.assertTrue(self.publish_runs(render="skipped", stills="success"))   # the film's inputs are the committed ones
+        self.assertFalse(self.publish_runs(render="failure", stills="success"))  # a failed film blocks the stills too
+        self.assertFalse(self.publish_runs(render="cancelled", stills="success"))
+        self.assertFalse(self.publish_runs(render="success", stills="cancelled"))
+        self.assertFalse(self.publish_runs(render="skipped", stills="skipped"))  # nothing rendered, nothing to publish
+        self.assertFalse(self.publish_runs(render="skipped", stills="failure"))  # nothing to publish either
+        self.assertFalse(self.publish_runs(decide="failure", render="success", stills="success"))
+
+    def test_each_adopt_step_runs_only_for_the_artifact_that_exists(self):
+        publish = job_body("site-video.yml", "publish")
+        for name, job in (("Adopt the film", "render"), ("Adopt the stills", "stills"), ("Download the film (data)", "render"),
+                          ("Download the stills (data)", "stills")):
+            step = publish[publish.index(f"- name: {name}"):]
+            step = step[:step.index("\n      - ", 1)] if "\n      - " in step[1:] else step
+            self.assertIn(f"needs.{job}.result == 'success'", step, name)
 
     def test_the_deploy_is_a_dispatch_of_pages_on_main_because_a_tag_run_may_not_deploy_pages(self):
         """The `github-pages` environment admits deployments from `main` only (checked with the API), so a run on a

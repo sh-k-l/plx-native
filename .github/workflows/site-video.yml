@@ -481,15 +481,20 @@ jobs:
           key: site-stills
       - name: Build the host FFmpeg
         # The player scenes demux a real stream, so `ff.rs` needs the bundled FFmpeg's own host build, as on a Mac
-        # (`make sim-macos`). `ff.rs` opens `libavformat-plx.so.63` and its siblings out of the app directory
-        # (`pkg/`), so the soname-named files are copied there. About 30 s; nothing worth a cache.
+        # (`make sim-macos`). About 30 s; nothing worth a cache.
+        run: HOST=1 ./ci/build-ffmpeg.sh
+      - name: Build the screenshots simulator
+        # `make screenshots-sim` stages `.dylib`s as prerequisites (macOS); the `.so`s are put in place below.
+        run: make screenshots-sim FFMPEG_HOST_STAGED=
+      - name: Put the host FFmpeg beside the simulator
+        # AFTER the make above, not before: on a fresh checkout the Makefile's RUST_CFG stamp differs and it deletes
+        # `pkg/lib*-plx.so.*` while parsing. `ff.rs` opens `libavformat-plx.so.63` and its siblings out of the app
+        # directory (`pkg/`); without them every stream ends at once ("ff: avformat is MISSING from the app
+        # directory ... EOS pushed at true EOF") and the player scenes have no picture.
         run: |
-          HOST=1 ./ci/build-ffmpeg.sh
           cp -L vendor/ffmpeg-prefix-host/lib/lib*-plx.so.[0-9][0-9] pkg/
           ls -l pkg/lib*-plx.so.*
-      - name: Build the screenshots simulator
-        # `make screenshots-sim` stages `.dylib`s as prerequisites (macOS); the `.so`s are in place above.
-        run: make screenshots-sim FFMPEG_HOST_STAGED=
+          test -f pkg/libavformat-plx.so.63 -a -f pkg/libavcodec-plx.so.63 -a -f pkg/libavutil-plx.so.61
 
       - name: Cache the demo library's source images
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -520,17 +525,34 @@ jobs:
           xvfb-run -a -s '-screen 0 1920x1080x24' \
             python3 tools/site_stills.py render --out out/stills --bin "$SHOT_TDIR/debug/plxnative-sim"
           echo "STILLS_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
-      - name: DIAGNOSTIC (temporary) the player scene alone, kept
+      - name: DIAGNOSTIC (temporary) site-tiles pairs, diffed
         if: always()
         run: |
           set +e
-          ls -l "$PLXNATIVE_DEMO_CACHE/derived" | head -40
-          ffprobe -hide_banner "$PLXNATIVE_DEMO_CACHE"/derived/*intel* 2>&1 | head -30
-          ls -l pkg/lib*-plx.so.*
-          xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/screenshots.py --bin "$SHOT_TDIR/debug/plxnative-sim" --only player,site-up-next --keep --out out/diag-shots 2>&1 | tail -60
-          for d in /tmp/plxnative-shot-player-* /tmp/plxnative-shot-site-up-next-*; do
-            echo "=== $d"; ls "$d"; echo "--- sim.out"; tail -40 "$d/sim.out"; echo "--- events"; tail -80 "$d/plxnative-events.log"
+          rm -rf out/diag; mkdir -p out/diag
+          for n in 1 2 3; do
+            xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/screenshots.py --bin "$SHOT_TDIR/debug/plxnative-sim" --only site-tiles --keep --out out/diag/shots$n 2>&1 | tail -3
+            d=$(ls -d /tmp/plxnative-shot-site-tiles-* | head -1)
+            mv "$d/shot.png" out/diag/tiles$n.png
+            cp "$d/plxnative-events.log" out/diag/tiles$n.events.log
+            rm -rf /tmp/plxnative-shot-site-tiles-*
           done
+          python3 - <<'PY'
+          from PIL import Image, ImageChops
+          import itertools
+          for a, b in ((1, 2), (1, 3), (2, 3)):
+              A = Image.open(f"out/diag/tiles{a}.png").convert("RGB")
+              B = Image.open(f"out/diag/tiles{b}.png").convert("RGB")
+              d = ImageChops.difference(A, B)
+              bbox = d.getbbox()
+              hist = d.convert("L").histogram()
+              n = sum(hist[1:])
+              print(f"pair {a},{b}: size {A.size} differing {n} bbox {bbox} hist(1..16) {hist[1:17]} max {max(i for i,v in enumerate(hist) if v)}")
+              if bbox:
+                  x0, y0, x1, y1 = bbox
+                  d.point(lambda v: min(255, v * 16)).crop(bbox).save(f"out/diag/diff{a}{b}.png")
+          PY
+          grep -c . out/diag/tiles*.events.log
       - name: Each scene's pair against its noise bound
         if: always()
         run: |
@@ -544,6 +566,16 @@ jobs:
       - name: Manifest
         run: |
           xvfb-run -a -s '-screen 0 1920x1080x24' python3 tools/site_stills.py manifest out/stills
+      - name: Upload the diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stills-diag-${{ github.sha }}
+          path: |
+            out/diag
+            out/stills/stability.json
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload the stills
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
