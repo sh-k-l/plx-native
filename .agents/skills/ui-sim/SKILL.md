@@ -244,6 +244,12 @@ make screenshots SHOT_HERO_VARIANTS=1 # also home-hero-<film>.jpg for each hero 
   composes `site/og/card.html` around the home figure the same run staged, so a run that includes
   `home` needs a headless Chromium (Chrome, Chromium or a Playwright cache; `CHROME=` overrides).
   Outputs are all-or-nothing: one failed scene and nothing is written anywhere.
+- **After a stable release most of these refresh themselves** (`site-video.yml`'s `stills` job,
+  `tools/site_stills.py`, on Linux/llvmpipe with the pinned ffmpeg). `python3 tools/site_stills.py files`
+  lists them and `files --manual` the ones a Mac `make screenshots` still has to make: the two player scenes
+  (playback on the runner ends at EOF), four scenes whose two Linux renders were not byte-identical (`home`
+  and so the link card, `account-menu`, `detail`, `library-grid`) and the TV photograph. A Mac render is a
+  preview of what the bot commits.
 - **The site's copies follow the render.** After re-rendering the `site-*` scenes, run
   `python3 tools/render-site-variants.py` (the WebP of every close-up and the phone copies of
   tiles and player) and then `python3 tools/render-site-glows.py`; both read the rendered JPEGs.

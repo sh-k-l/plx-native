@@ -598,23 +598,31 @@ class SiteVideoRelease(unittest.TestCase):
         self.assertNotIn("inputs.ref", code("site-video.yml"))
 
     def test_the_jobs_are_decide_render_publish_pages_in_that_chain(self):
-        self.assertEqual(self.jobs(), ["decide", "render", "publish", "pages"])
+        self.assertEqual(self.jobs(), ["decide", "render", "stills", "publish", "pages"])
         self.assertIn("needs: decide", job_body("site-video.yml", "render"))
         self.assertIn("needs.decide.outputs.needs_render == 'true'", job_body("site-video.yml", "render"))
         publish = job_body("site-video.yml", "publish")
-        self.assertIn("needs: [decide, render]", publish)
-        self.assertIn("needs.render.result == 'success'", publish)
-        self.assertIn("needs.decide.outputs.needs_render == 'true'", publish)
+        self.assertIn("needs: [decide, render, stills]", publish)
+        self.assertIn("needs.render.result == 'success' || needs.stills.result == 'success'", publish)
+        # a failed or cancelled film stops the publish; a failed stills job (nondeterministic renders) leaves the film's
+        # refresh alone and the run red
+        self.assertIn("needs.render.result != 'failure'", publish)
+        self.assertIn("needs.render.result != 'cancelled'", publish)
+        self.assertNotIn("needs.stills.result != 'failure'", publish)
+        stills = job_body("site-video.yml", "stills")
+        self.assertIn("needs: decide", stills)
+        self.assertIn("needs.decide.outputs.needs_stills == 'true'", stills)
 
     def test_only_publish_holds_a_write_token_and_the_workflow_default_is_read(self):
         body = code("site-video.yml")
         self.assertRegex(body, r"(?m)^permissions:\n  contents: read\n")
         self.assertEqual(body.count("contents: write"), 1)
         self.assertIn("contents: write", job_body("site-video.yml", "publish"))
-        for job in ("decide", "render"):
+        for job in ("decide", "render", "stills"):
             self.assertNotIn("write", job_body("site-video.yml", job).replace("--write", ""))
         # nothing the workflow checks out for rendering keeps the token on disk
         self.assertIn("persist-credentials: false", job_body("site-video.yml", "render"))
+        self.assertIn("persist-credentials: false", job_body("site-video.yml", "stills"))
         self.assertIn("persist-credentials: false", job_body("site-video.yml", "decide"))
         # a dry run holds no credential either: only the checkout that a publish uses keeps it
         publish = job_body("site-video.yml", "publish")
@@ -631,7 +639,7 @@ class SiteVideoRelease(unittest.TestCase):
     def test_nothing_renders_a_ref_a_job_computed_and_the_write_token_never_runs_the_rendered_code(self):
         """The CodeQL finding: a checkout whose `ref:` comes from an input or a job output, followed by cache steps that
         execute what they restored, is cache poisoning from a dispatched ref into main's caches."""
-        for job in ("decide", "render"):
+        for job in ("decide", "render", "stills"):
             for step in self.checkouts(job):
                 self.assertNotRegex(step, r"(?m)^\s+ref:", f"{job}'s checkout names a ref")
         render = job_body("site-video.yml", "render")
@@ -679,6 +687,30 @@ class SiteVideoRelease(unittest.TestCase):
         self.assertNotRegex(publish, r"push[^\n]*(--force|-f\b|\+HEAD)")
         self.assertIn("github-actions[bot]", publish)
         self.assertIn("commit-message", publish)
+
+    def test_the_stills_ride_the_same_run_and_the_same_commit_on_the_same_terms(self):
+        """The simulator-made stills refresh with the film: rendered twice and required byte-identical, adopted by MAIN's
+        tool from an artifact (data), one allow-listed bot commit, no second workflow, nothing loosened."""
+        body = code("site-video.yml")
+        stills, publish = job_body("site-video.yml", "stills"), job_body("site-video.yml", "publish")
+        self.assertEqual(len(re.findall(r"(?m)^name:", body)), 1)
+        self.assertEqual(stills.count("site_stills.py render"), 2)
+        self.assertIn("site_stills.py compare out/stills-a out/stills-b", stills)
+        self.assertNotIn("continue-on-error", stills)
+        self.assertIn("site_stills.py manifest", stills)
+        self.assertIn("actions/upload-artifact@", stills)
+        # the pinned ffmpeg is the only encoder the stills see
+        self.assertIn("site_video.py ffmpeg-fetch", stills)
+        self.assertIn('echo "$RUNNER_TEMP/pinned-bin" >> "$GITHUB_PATH"', stills)
+        # publish: main's tool, the expected revision, the allow-list, one commit
+        self.assertIn('site_stills.py adopt "$RUNNER_TEMP/stills" --write --expect-rev "$SHA"', publish)
+        self.assertIn("allowed=", publish)
+        self.assertNotIn("navblur", publish)
+        self.assertEqual(publish.count("git commit -F"), 1)
+        self.assertIn("--stills-manifest", publish)
+        self.assertEqual(code("release.yml").count("gh workflow run site-video.yml"), 1)
+        for name in ("rc.yml", "nightly.yml"):
+            self.assertNotIn("site_stills", code(name))
 
     def test_the_deploy_is_a_dispatch_of_pages_on_main_because_a_tag_run_may_not_deploy_pages(self):
         """The `github-pages` environment admits deployments from `main` only (checked with the API), so a run on a
